@@ -1,0 +1,1510 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Modal } from "react-bootstrap";
+// Remove ReactPlayer import
+import { toast } from "react-toastify";
+import { io, Socket } from "socket.io-client";
+// Add mediasoup import
+import * as mediasoupClient from "mediasoup-client";
+import { types } from "mediasoup-client";
+
+export interface User {
+  userId: string;
+  fullName: string;
+  email: string;
+}
+
+export interface LiveStreamProps {
+  orgId: string;
+  userId: string;
+  role: string;
+}
+
+import { useDebounce } from "../../hooks/useDebounce";
+import { GetAssignee } from "../../services/common.services";
+import { callAllMember } from "../../modules/auth/redux/AuthCRUD";
+import { Loader } from "../../CommonFunctions/OldCommonFunction";
+import { getGreetingMessage, paginatioAndRowsPerPage } from "../../CommonFunctions/CommonFunction";
+import { shallowEqual, useDispatch, useSelector } from "react-redux";
+import { RootState } from "../../setup";
+import { userInfoActions } from "../../modules/auth/redux/UserInfoRedux";
+import moment from "moment";
+import { LoadingModal } from "../../components/PopUpModal/Loading";
+import usePresence from "../../hooks/usePresence";
+import AuditReasonModal from "../../components/common/AuditReasonModal";
+import { addLiveTrackingAuditLog } from "../../services/screenshot.services";
+import dayjs from "dayjs";
+
+const ITEMS_PER_PAGE = 25;
+const MAX_RETRY_ATTEMPTS = 8;
+const RETRY_DELAY = 5000;
+
+const SERVER = import.meta.env.VITE_APP_LIVE_STREAM_URL;
+
+// Add StreamData interface
+interface StreamData {
+  id: string;
+  producerId: string;
+  stream: MediaStream;
+  hasVideo: boolean;
+  hasAudio: boolean;
+  kind: string;
+}
+
+interface JoinRoomResponse {
+  error?: string;
+  rtpCapabilities?: any;
+}
+
+interface TransportResponse {
+  error?: string;
+  id: string;
+  iceParameters: any;
+  iceCandidates: any;
+  dtlsParameters: any;
+}
+
+interface ConnectResponse {
+  error?: string;
+}
+
+interface ConsumeResponse {
+  error?: string;
+  consumers?: Array<{
+    id: string;
+    producerId: string;
+    kind: string;
+    rtpParameters: any;
+  }>;
+}
+
+const LiveStreaming: React.FC = () => {
+  const dispatch = useDispatch();
+  const SelectedUser: any = useSelector<RootState>(
+    ({ data }) => data,
+    shallowEqual,
+  );
+  const videoRef = React.useRef<HTMLVideoElement>(null);
+  const [show, setShow] = useState(false);
+
+  const [showLoadingModal, setShowLoadingModal] = useState(false);
+  const [memberOption, setMemberOption] = useState<any[]>([]);
+  const [optionSelectedMember, setOptionSelectedMember] = useState<any>("");
+  const [image, setImage] = useState<string>("");
+  const [loading, setLoading] = useState<boolean>(false);
+  const [disableReactSelect, setDisableReactSelect] = useState<boolean>(false);
+  const [modalsOpen, setModalsOpen] = useState<boolean>(false);
+  const [imgIndex, setImgIndex] = useState(0);
+
+  const [currentLiveUser, setCurrentLiveUser] = useState<string | undefined>(
+    undefined,
+  );
+
+
+  const [modalOpen, setModalOpen] = useState(false);
+  // Add missing streams state
+  const [streams, setStreams] = useState<StreamData[]>([]);
+  const [retryCount, setRetryCount] = useState(0);
+  const [isRetrying, setIsRetrying] = useState(false);
+  const [videoRetryLoader, setVideoRetryLoader] = useState<boolean>(false);
+  const [connectionStatus, setConnectionStatus] =
+    useState<string>("connecting");
+
+  // Search and filter
+  const [searchTerm, setSearchTerm] = useState("");
+  const [showOnlineOnly, setShowOnlineOnly] = useState(true);
+
+  // Audit reason modal state
+  const [showReasonModal, setShowReasonModal] = useState(false);
+  const [pendingStreamUser, setPendingStreamUser] = useState<any>(null);
+
+  // Pagination
+  const [currentPage, setCurrentPage] = useState(1);
+  const [itemsPerPage, setItemsPerPage] = useState(ITEMS_PER_PAGE);
+
+  const rowsPerPageOptions = [
+    { value: 20, label: "20" },
+    { value: 40, label: "40" },
+    { value: 60, label: "60" },
+    { value: 100, label: "100" },
+  ];
+
+  const isStreamClosedRef = useRef(false);
+
+  // Add user socket ref
+  const userSocketRef = useRef<Socket | null>(null);
+
+  // Add room ID ref
+  const roomIdRef = useRef<string>("");
+
+  // Add mediasoup refs
+  const deviceRef = useRef<mediasoupClient.Device | undefined>();
+  const consumerTransportRef = useRef<types.Transport | undefined>();
+  const consumersRef = useRef<types.Consumer[]>([]);
+
+  // Add video element refs
+  const videoElementRef = useRef<HTMLVideoElement | null>(null);
+  const isVideoAttachedRef = useRef(false);
+
+  // Use the consolidated presence hook with stream functionality
+  const { onlineUsers, isOnline, requestStreamStart, socket } = usePresence(
+    SelectedUser.userId,
+    SelectedUser.orgId,
+  );
+
+  // Monitor socket connection status and user offline events
+  useEffect(() => {
+    if (socket) {
+      const updateConnectionStatus = () => {
+        const status = socket.connected ? "connected" : "disconnected";
+        setConnectionStatus(status);
+      };
+
+      const handleUserOffline = (data: any) => {
+        const offlineUserId = typeof data === "string" ? data : data?.userId;
+
+        // Check if the offline user is currently being streamed AND is in the online agent users list
+        if (offlineUserId && currentLiveUser === offlineUserId && modalOpen) {
+          // Double check if this user was actually an online agent user
+          const wasOnlineAgent = onlineUsers.includes(offlineUserId);
+
+          if (wasOnlineAgent) {
+            // Show toast notification
+            toast.warning(
+              `${
+                optionSelectedMember?.fullName || "User"
+              } went offline. Stream ended.`,
+            );
+
+            // Close the modal and clean up
+            handleStreamClose();
+          }
+        }
+      };
+
+      socket.on("connect", updateConnectionStatus);
+      socket.on("disconnect", updateConnectionStatus);
+      socket.on("connect_error", (error) => {
+        console.error("Connection error:", error);
+        setConnectionStatus("error");
+      });
+      socket.on("user-offline", handleUserOffline);
+
+      // Initial status
+      updateConnectionStatus();
+
+      return () => {
+        socket.off("connect", updateConnectionStatus);
+        socket.off("disconnect", updateConnectionStatus);
+        socket.off("connect_error");
+        socket.off("user-offline", handleUserOffline);
+      };
+    } else {
+      setConnectionStatus("no-socket");
+    }
+  }, [socket, currentLiveUser, modalOpen, optionSelectedMember, onlineUsers]);
+
+  // Memoized display users - filtered by online status and search term
+  const displayUsers = useMemo(() => {
+    let users = memberOption;
+
+    // Filter by online status (skip in demo mode)
+    if (showOnlineOnly && SelectedUser.orgId !== import.meta.env.VITE_APP_DEME_ORG_ID) {
+      users = users.filter((user: any) => isOnline(user.userId));
+    }
+
+    // Filter by search term
+    if (searchTerm.trim()) {
+      const lowercaseSearch = searchTerm.toLowerCase();
+      users = users.filter(
+        (user: any) =>
+          user.fullName.toLowerCase().includes(lowercaseSearch) ||
+          user.email.toLowerCase().includes(lowercaseSearch),
+      );
+    }
+
+    return users;
+  }, [memberOption, searchTerm, showOnlineOnly, onlineUsers, SelectedUser.orgId]);
+
+  // Reset to page 1 when display users change
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [displayUsers.length]);
+
+  // Pagination calculations
+  const indexOfLastItem = currentPage * itemsPerPage;
+  const indexOfFirstItem = indexOfLastItem - itemsPerPage;
+  const currentItems = useMemo(
+    () => displayUsers.slice(indexOfFirstItem, indexOfLastItem),
+    [displayUsers, indexOfFirstItem, indexOfLastItem],
+  );
+  const totalPages = Math.ceil(displayUsers.length / itemsPerPage);
+  const hasData = displayUsers.length > 0;
+
+  // Online users count
+  const onlineCount = useMemo(() => {
+    if (SelectedUser.orgId === import.meta.env.VITE_APP_DEME_ORG_ID) {
+      return memberOption.length;
+    }
+    return memberOption.filter((user: any) => isOnline(user.userId)).length;
+  }, [memberOption, onlineUsers, SelectedUser.orgId]);
+
+  useEffect(() => {
+    if (SelectedUser.orgId === import.meta.env.VITE_APP_DEME_ORG_ID) {
+      // For demo org, set dummy active users
+      const dummyUsers = memberOption.map((user: any) => user.userId);
+      // setActiveUsers(dummyUsers);
+    }
+  }, [memberOption, SelectedUser.orgId]);
+
+  useEffect(() => {
+    dispatch(
+      userInfoActions.updateHeaderMessage({
+        heading: "Live Streaming",
+        subheading:
+          "Monitor real-time screen activities of your team members.",
+      }),
+    );
+
+    return () => {
+      let greeting = getGreetingMessage();
+      dispatch(
+        userInfoActions.updateHeaderMessage({
+          heading: `Hi ${SelectedUser.userName}, ${greeting}`,
+          subheading: `${moment().format("Do MMMM, YYYY")}`,
+        }),
+      );
+    };
+  }, []);
+
+  useEffect(() => {
+    if (SelectedUser.role === import.meta.env.VITE_APP_SYSTEM_SECOND_ROLE) {
+      GetAssignee()
+        .then((res) => {
+          const users = res.data.filter(
+            (user: any) =>
+              user.assignedId !== SelectedUser.userId &&
+              user.assigneeId !== SelectedUser.userId,
+          );
+          const newList = users.map((item: any) => ({
+            fullName: item.assigneeName,
+            userId: item.assigneeId,
+            email: item.assigneeEmail,
+          }));
+          setMemberOption(newList);
+        })
+        .catch((err) => {
+          console.log(err);
+        });
+    } else if (
+      SelectedUser.role === import.meta.env.VITE_APP_SYSTEM_FIRST_ROLE ||
+      SelectedUser.role === import.meta.env.VITE_APP_SYSTEM_EIGHTH_ROLE ||
+      SelectedUser.role === import.meta.env.VITE_APP_SYSTEM_FIFTH_ROLE
+    ) {
+      callAllMember()
+        .then((res) => {
+          const users = res.data.filter(
+            (user: any) =>
+              user.assignedId !== SelectedUser.userId &&
+              user.userId !== SelectedUser.userId,
+          );
+          const newList = users.map((item: any) => ({
+            fullName: item.fullName,
+            userId: item.userId,
+            email: item.email,
+          }));
+
+          setMemberOption(newList);
+        })
+        .catch((err: any) => {
+          console.log(err);
+        });
+    }
+
+    // return () => {
+    //   if (optionSelectedMember.userId) {
+    //     stopStream(optionSelectedMember.userId);
+    //   }
+    // };
+  }, []);
+
+  const userValid = (user: any) => {
+    if (SelectedUser.orgId === import.meta.env.VITE_APP_DEME_ORG_ID) {
+      return true; // All users valid in demo mode
+    }
+    const isUserOnline = isOnline(user.userId);
+
+    return isUserOnline;
+  };
+
+  // Add centralized stop stream function
+  const stopStreamForUser = (targetUserId: string, roomName?: string) => {
+    if (!userSocketRef.current || !targetUserId) return;
+
+    const roomToUse = roomName || roomIdRef.current;
+
+    if (userSocketRef.current.connected) {
+      userSocketRef.current.emit("request-stop-stream", {
+        targetUserId,
+        roomName: roomToUse,
+      });
+    }
+  };
+
+  const handleLoadingClose = () => {
+    setShowLoadingModal(false);
+    setVideoRetryLoader(false);
+    setModalOpen(false);
+    isStreamClosedRef.current = true;
+
+    if (optionSelectedMember?.userId) {
+      // Clean up mediasoup resources
+      consumersRef.current.forEach((c) => c.close());
+      consumersRef.current = [];
+      if (consumerTransportRef.current) {
+        consumerTransportRef.current.close();
+        consumerTransportRef.current = undefined;
+      }
+      deviceRef.current = undefined;
+
+      // Clean up user socket
+      if (userSocketRef.current) {
+        userSocketRef.current.disconnect();
+        userSocketRef.current = null;
+      }
+
+      // Use the centralized stop function
+      stopStreamForUser(optionSelectedMember.userId);
+    }
+
+    setStreams([]);
+    setCurrentLiveUser(undefined);
+  };
+
+  const debouncedSearch = useDebounce((value: string) => {
+    setSearchTerm(value);
+    setCurrentPage(1);
+  }, 300);
+
+  const handleSearchChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    debouncedSearch(e.target.value);
+  };
+
+  const handleRowsPerPageChange = useCallback((option: any) => {
+    setItemsPerPage(option.value);
+    setCurrentPage(1);
+  }, []);
+
+  const MAX_SETUP_RETRIES = 3;
+  const SETUP_RETRY_DELAY = 2000; // 2 seconds
+  const MAX_SOCKET_RETRIES = 3;
+  const SOCKET_RETRY_DELAY = 2000; // 2 seconds
+
+  const setupMediasoupStreaming = async (
+    targetUserId: string,
+    retryCount = 0,
+  ): Promise<boolean> => {
+    try {
+      const userSocket = userSocketRef.current;
+      if (!userSocket) {
+        throw new Error("User socket not available");
+      }
+
+      if (!userSocket.connected) {
+        throw new Error("User socket is not connected");
+      }
+
+      // Use the stored room ID
+      const roomName = roomIdRef.current;
+
+      // Step 1: Join room
+      const joinResp = await new Promise<JoinRoomResponse>((res, reject) => {
+        const timeout = setTimeout(
+          () => reject(new Error("Join room timeout")),
+          10000,
+        );
+        userSocket.emit(
+          "joinRoom",
+          { roomName, userId: targetUserId },
+          (response: JoinRoomResponse) => {
+            clearTimeout(timeout);
+            res(response);
+          },
+        );
+      });
+
+      if (joinResp.error) throw new Error(joinResp.error);
+
+      // Step 2: Load device
+      const device = new mediasoupClient.Device();
+      await device.load({ routerRtpCapabilities: joinResp.rtpCapabilities });
+      deviceRef.current = device;
+
+      // Step 3: Create transport
+      const transportResp = await new Promise<TransportResponse>(
+        (res, reject) => {
+          const timeout = setTimeout(
+            () => reject(new Error("Create transport timeout")),
+            10000,
+          );
+          userSocket.emit(
+            "createConsumerTransport",
+            { roomName },
+            (response: TransportResponse) => {
+              clearTimeout(timeout);
+              res(response);
+            },
+          );
+        },
+      );
+
+      if (transportResp.error) throw new Error(transportResp.error);
+
+      const consumerTransport = device.createRecvTransport(transportResp);
+      consumerTransportRef.current = consumerTransport;
+
+      // Step 4: Connect transport
+      consumerTransport.on(
+        "connect",
+        async (
+          { dtlsParameters }: any,
+          callback: () => void,
+          errback: (error: Error) => void,
+        ) => {
+          userSocket.emit(
+            "connectConsumerTransport",
+            { dtlsParameters, roomName },
+            (resp: ConnectResponse) => {
+              if (resp?.error) return errback(new Error(resp.error));
+              callback();
+            },
+          );
+        },
+      );
+
+      // Step 5: Consume existing producers
+      const consumeResp = await new Promise<ConsumeResponse>((res, reject) => {
+        const timeout = setTimeout(
+          () => reject(new Error("Consume timeout")),
+          10000,
+        );
+        userSocket.emit(
+          "consume",
+          { roomName, rtpCapabilities: device.rtpCapabilities },
+          (response: ConsumeResponse) => {
+            clearTimeout(timeout);
+            res(response);
+          },
+        );
+      });
+
+      if (consumeResp.error) throw new Error(consumeResp.error);
+
+      // Step 6: Create consumers and organize tracks
+      const videoTracks: MediaStreamTrack[] = [];
+      const audioTracks: MediaStreamTrack[] = [];
+
+      if (consumeResp.consumers) {
+        for (const c of consumeResp.consumers) {
+          const consumer = await consumerTransport.consume({
+            id: c.id,
+            producerId: c.producerId,
+            kind: c.kind as types.MediaKind,
+            rtpParameters: c.rtpParameters,
+          });
+
+          consumersRef.current.push(consumer);
+
+          const track = consumer.track;
+
+          // Organize tracks by type
+          if (track.kind === "video") {
+            videoTracks.push(track);
+            track.onended = () =>
+              console.error("❌ Video track ended:", track.id);
+            track.onmute = () =>
+              console.warn("⚠️ Video track muted:", track.id);
+            track.onunmute = () =>
+              console.log("✅ Video track UNMUTED:", track.id);
+          } else if (track.kind === "audio") {
+            audioTracks.push(track);
+            track.onended = () =>
+              console.error("❌ Audio track ended:", track.id);
+            track.onmute = () =>
+              console.warn("⚠️ Audio track muted:", track.id);
+            track.onunmute = () =>
+              console.log("✅ Audio track UNMUTED:", track.id);
+          }
+
+          consumer.on("trackended", () =>
+            console.log("track ended", consumer.id),
+          );
+          consumer.on("transportclose", () =>
+            console.log("transport closed", consumer.id),
+          );
+        }
+      }
+
+      // Step 7: Create combined streams
+      const streamsList: StreamData[] = [];
+
+      if (videoTracks.length > 0) {
+        videoTracks.forEach((videoTrack, index) => {
+          const stream = new MediaStream([videoTrack]);
+          if (audioTracks[index]) {
+            stream.addTrack(audioTracks[index]);
+          }
+
+          streamsList.push({
+            id: `stream-${index}`,
+            producerId: videoTrack.id,
+            stream: stream,
+            hasVideo: true,
+            hasAudio: audioTracks[index] !== undefined,
+            kind: "video",
+          });
+        });
+      } else if (audioTracks.length > 0) {
+        audioTracks.forEach((audioTrack, index) => {
+          const stream = new MediaStream([audioTrack]);
+          streamsList.push({
+            id: `audio-stream-${index}`,
+            producerId: audioTrack.id,
+            stream: stream,
+            hasVideo: false,
+            hasAudio: true,
+            kind: "audio",
+          });
+        });
+      }
+
+      setStreams(streamsList);
+      setShowLoadingModal(false);
+      setVideoRetryLoader(false);
+      setModalOpen(true);
+      return true;
+    } catch (error) {
+      console.error(
+        `❌ Mediasoup setup failed (attempt ${retryCount + 1}):`,
+        error,
+      );
+
+      // Clean up on error
+      consumersRef.current.forEach((c) => c.close());
+      consumersRef.current = [];
+      if (consumerTransportRef.current) {
+        consumerTransportRef.current.close();
+        consumerTransportRef.current = undefined;
+      }
+      deviceRef.current = undefined;
+
+      // Retry logic
+      if (retryCount < MAX_SETUP_RETRIES - 1) {
+        await new Promise((resolve) => setTimeout(resolve, SETUP_RETRY_DELAY));
+
+        // Check if socket is still connected before retrying
+        if (userSocketRef.current?.connected) {
+          return setupMediasoupStreaming(targetUserId, retryCount + 1);
+        } else {
+          console.error("❌ Socket disconnected, cannot retry");
+          setShowLoadingModal(false);
+          setVideoRetryLoader(false);
+          toast.error("Connection lost. Please try again.");
+          return false;
+        }
+      } else {
+        // Final failure after all retries
+        console.error("❌ Failed to setup streaming after all retries");
+        setShowLoadingModal(false);
+        setVideoRetryLoader(false);
+        toast.error(
+          "Unable to connect to stream. Please try selecting the user again.",
+        );
+
+        // Clean up socket
+        if (userSocketRef.current) {
+          userSocketRef.current.disconnect();
+          userSocketRef.current = null;
+        }
+        return false;
+      }
+    }
+  };
+
+  const handleUserClick = async (user: User) => {
+    if (connectionStatus !== "connected") {
+      toast.error("Not connected to server. Please wait...");
+      return;
+    }
+
+    if (!socket?.connected) {
+      toast.error("Socket not connected");
+      return;
+    }
+
+    if (socket?.io?.engine?.transport?.name !== "websocket") {
+      toast.error("Invalid transport. Server requires websocket connection.");
+      return;
+    }
+
+    // Store reference to previous user for cleanup AFTER new connection
+    const previousUser = optionSelectedMember?.userId;
+    const previousSocket = userSocketRef.current;
+    const previousRoomId = roomIdRef.current;
+
+    // Reset state immediately
+    isStreamClosedRef.current = false;
+    setStreams([]);
+
+    // Generate new random two-digit number for this session
+    const randomTwoDigit = Math.floor(Math.random() * 90) + 10; // 10-99
+    const newRoomName = `${user.userId}_${SelectedUser.orgId}_${randomTwoDigit}`;
+    roomIdRef.current = newRoomName;
+    console.log("Generated new room ID:", newRoomName);
+
+    try {
+      if (SelectedUser.orgId !== import.meta.env.VITE_APP_DEME_ORG_ID) {
+        setShowLoadingModal(true);
+        setVideoRetryLoader(true);
+
+        // Try to connect socket with retries
+        let socketConnected = false;
+        let currentRetry = 0;
+        let userSocket: Socket | null = null;
+
+        while (!socketConnected && currentRetry < MAX_SOCKET_RETRIES) {
+          try {
+            // Close any previous failed socket attempt
+            if (userSocket && !userSocket.connected) {
+              userSocket.removeAllListeners();
+              userSocket.close();
+              userSocket = null;
+            }
+
+            // Create NEW user socket with autoConnect: false
+            userSocket = io(SERVER, {
+              query: {
+                role: "user",
+                targetUserId: user.userId,
+                orgId: SelectedUser.orgId,
+              },
+              transports: ["websocket"],
+              upgrade: false,
+              timeout: 10000,
+              forceNew: true,
+              autoConnect: false,
+              reconnection: false, // Disable auto-reconnection
+            });
+
+            // Wait for socket connection with timeout
+            await new Promise<void>((resolve, reject) => {
+              const connectionTimeout = setTimeout(() => {
+                console.error("⏱️ Connection timeout after 15 seconds");
+                if (userSocket) {
+                  userSocket.removeAllListeners();
+                  userSocket.close();
+                }
+                reject(new Error("Socket connection timeout after 15 seconds"));
+              }, 15000);
+
+              const onConnect = () => {
+                clearTimeout(connectionTimeout);
+
+                // Remove listeners
+                userSocket?.off("connect", onConnect);
+                userSocket?.off("connect_error", onConnectError);
+
+                resolve();
+              };
+
+              const onConnectError = (error: Error) => {
+                clearTimeout(connectionTimeout);
+                console.error("❌ User socket connection error:", {
+                  message: error.message,
+                  type: error.constructor.name,
+                  stack: error.stack,
+                });
+
+                // Remove listeners
+                userSocket?.off("connect", onConnect);
+                userSocket?.off("connect_error", onConnectError);
+
+                if (userSocket) {
+                  userSocket.removeAllListeners();
+                  userSocket.close();
+                }
+                reject(error);
+              };
+
+              userSocket?.on("connect", onConnect);
+              userSocket?.on("connect_error", onConnectError);
+
+              // NOW connect the socket
+              userSocket?.connect();
+            });
+
+            // Verify connection
+            if (!userSocket.connected) {
+              throw new Error(
+                "Socket connected event fired but socket.connected is false",
+              );
+            }
+
+            // If we reach here, connection was successful
+            socketConnected = true;
+
+            // NOW that new socket is connected, clean up the PREVIOUS stream
+            if (
+              previousSocket &&
+              previousUser &&
+              previousSocket !== userSocket &&
+              previousRoomId
+            ) {
+              console.log("🧹 Cleaning up previous stream for:", previousUser);
+
+              // Clean up mediasoup resources
+              consumersRef.current.forEach((c) => c.close());
+              consumersRef.current = [];
+              if (consumerTransportRef.current) {
+                consumerTransportRef.current.close();
+                consumerTransportRef.current = undefined;
+              }
+              deviceRef.current = undefined;
+
+              // Stop previous stream with the previous room ID using previous socket
+              previousSocket.emit("request-stop-stream", {
+                targetUserId: previousUser,
+                roomName: previousRoomId,
+              });
+
+              // Disconnect previous socket
+              previousSocket.disconnect();
+            }
+
+            // Set the new socket reference and update state
+            userSocketRef.current = userSocket;
+            setOptionSelectedMember(user);
+            setCurrentLiveUser(user.userId);
+
+            // Use the new room ID
+            const payload = {
+              targetUserId: user.userId,
+              roomName: newRoomName,
+              preferredAgentId: user.userId,
+            };
+
+            // Set up event handlers
+            userSocket.on("close", () => {
+              setShowLoadingModal(false);
+              setVideoRetryLoader(false);
+              setModalOpen(false);
+              if (userSocketRef.current === userSocket) {
+                userSocket?.disconnect();
+                userSocketRef.current = null;
+              }
+            });
+
+            userSocket.on("disconnect", (reason) => {
+              if (userSocketRef.current === userSocket) {
+                handleStreamClose();
+              }
+            });
+
+            userSocket.on("stream-stopped", (data: any) => {
+              handleStreamClose();
+              toast.info(`Stream ended.`);
+            });
+
+            userSocket.on("new-producer", (data: any) => {
+              // Producer detected
+            });
+
+            try {
+              // Emit stream start request
+              userSocket.emit("request-start-stream", payload);
+
+              // Wait for FFmpeg to start
+              await new Promise((resolve) => setTimeout(resolve, 5000));
+
+              const success = await setupMediasoupStreaming(user.userId);
+
+              if (!success) {
+                // Cleanup is already handled in setupMediasoupStreaming
+              }
+            } catch (error) {
+              console.error("❌ Error in stream setup:", error);
+              toast.error("Failed to setup stream");
+              setShowLoadingModal(false);
+              setVideoRetryLoader(false);
+              if (userSocketRef.current === userSocket) {
+                userSocket.disconnect();
+                userSocketRef.current = null;
+              }
+            }
+          } catch (error) {
+            currentRetry++;
+            console.error(
+              `❌ Socket connection failed (attempt ${currentRetry}/${MAX_SOCKET_RETRIES}):`,
+              error,
+            );
+
+            if (currentRetry < MAX_SOCKET_RETRIES) {
+              await new Promise((resolve) =>
+                setTimeout(resolve, SOCKET_RETRY_DELAY),
+              );
+            } else {
+              // Final failure after all socket retries
+              console.error("❌ Failed to connect socket after all retries");
+              setShowLoadingModal(false);
+              setVideoRetryLoader(false);
+              toast.error(
+                "Unable to establish connection. Please try again later.",
+              );
+
+              // Clean up any lingering socket
+              if (userSocket) {
+                userSocket.removeAllListeners();
+                userSocket.close();
+              }
+              return; // Exit the function
+            }
+          }
+        }
+      } else {
+        // Demo mode
+        setOptionSelectedMember(user);
+        setCurrentLiveUser(user.userId);
+        setModalOpen(true);
+        setShowLoadingModal(false);
+        setVideoRetryLoader(false);
+      }
+    } catch (error) {
+      console.error("❌ Error starting stream:", error);
+      setShowLoadingModal(false);
+      setVideoRetryLoader(false);
+    }
+  };
+
+  // Add state for buffering loader
+  const [isBuffering, setIsBuffering] = useState(false);
+
+  const handlePlayerError = async (error: any) => {
+    console.error("Player error:", error);
+    toast.error("Video playback error");
+  };
+
+  const handleBuffer = () => setIsBuffering(true);
+  const handleBufferEnd = () => setIsBuffering(false);
+
+  const handleStreamClose = () => {
+    // Clean up mediasoup resources
+    consumersRef.current.forEach((c) => c.close());
+    consumersRef.current = [];
+    if (consumerTransportRef.current) {
+      consumerTransportRef.current.close();
+      consumerTransportRef.current = undefined;
+    }
+    deviceRef.current = undefined;
+
+    // Reset video attachment flag
+    isVideoAttachedRef.current = false;
+
+    // Stop stream using centralized function
+    if (optionSelectedMember?.userId && roomIdRef.current) {
+      stopStreamForUser(optionSelectedMember.userId, roomIdRef.current);
+    }
+
+    // Clean up user socket
+    if (userSocketRef.current) {
+      userSocketRef.current.disconnect();
+      userSocketRef.current = null;
+    }
+
+    // Clear room ID
+    roomIdRef.current = "";
+
+    // Reset states
+    setStreams([]);
+    setModalOpen(false);
+    setCurrentLiveUser(undefined);
+    setOptionSelectedMember("");
+    isStreamClosedRef.current = true;
+  };
+
+  const handleUnmute = () => {
+    const audioElements = document.querySelectorAll("audio");
+    const videoElements = document.querySelectorAll("video");
+
+    audioElements.forEach((audio) => {
+      audio.muted = false;
+      audio.play().catch((err) => console.log("Audio play failed:", err));
+    });
+
+    videoElements.forEach((video) => {
+      if (video.paused) {
+        video.play().catch((err) => console.log("Video play failed:", err));
+      }
+    });
+  };
+
+  // Helper to get user initials for avatar
+  const getInitials = useCallback((name: string) => {
+    const parts = name.trim().split(/\s+/);
+    if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase();
+    return parts[0]?.[0]?.toUpperCase() || "?";
+  }, []);
+
+  // Add cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (optionSelectedMember?.userId) {
+        consumersRef.current.forEach((c) => c.close());
+        if (consumerTransportRef.current) {
+          consumerTransportRef.current.close();
+        }
+        if (userSocketRef.current) {
+          userSocketRef.current.disconnect();
+        }
+        // Use the centralized stop function
+        stopStreamForUser(optionSelectedMember.userId);
+      }
+      // Reset video attachment flag
+      isVideoAttachedRef.current = false;
+    };
+  }, [optionSelectedMember]);
+
+  // Reset video attachment flag when streams change
+  useEffect(() => {
+    isVideoAttachedRef.current = false;
+  }, [streams]);
+
+  // Add fullscreen state
+  const [isFullscreen, setIsFullscreen] = useState(false);
+
+  // Add fullscreen handler
+  const handleFullscreen = () => {
+    const videoElement = videoElementRef.current;
+    if (!videoElement) return;
+
+    if (!document.fullscreenElement) {
+      videoElement
+        .requestFullscreen()
+        .then(() => {
+          setIsFullscreen(true);
+        })
+        .catch((err) => {
+          console.error("Error attempting to enable fullscreen:", err);
+        });
+    } else {
+      document.exitFullscreen().then(() => {
+        setIsFullscreen(false);
+      });
+    }
+  };
+
+  // Add fullscreen change listener
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      setIsFullscreen(!!document.fullscreenElement);
+    };
+
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    return () => {
+      document.removeEventListener("fullscreenchange", handleFullscreenChange);
+    };
+  }, []);
+
+  // Add ref for demo video
+  const demoVideoRef = useRef<HTMLVideoElement>(null);
+
+  // Function to prevent pause/play events
+  const handleVideoEvents = (e: React.SyntheticEvent<HTMLVideoElement>) => {
+    const target = e.target as HTMLVideoElement;
+
+    // Prevent pausing the video
+    if (e.type === "pause") {
+      e.preventDefault();
+      target.play().catch((err) => console.log("Auto-play failed:", err));
+    }
+
+    // Prevent seeking to beginning (which would pause)
+    if (e.type === "seeking" && target.currentTime === 0) {
+      e.preventDefault();
+    }
+  };
+
+  // Add CSS styles for hiding play/pause button
+  useEffect(() => {
+    const style = document.createElement("style");
+    style.textContent = `
+      .custom-video-controls::-webkit-media-controls-play-button,
+      .custom-video-controls::-webkit-media-controls-start-playback-button {
+        display: none !important;
+        opacity: 0 !important;
+        pointer-events: none !important;
+      }
+      
+      .custom-video-controls::-moz-media-controls-play-button {
+        display: none !important;
+      }
+      
+      /* Hide the center play button overlay */
+      .custom-video-controls::-webkit-media-controls-overlay-play-button {
+        display: none !important;
+        opacity: 0 !important;
+        pointer-events: none !important;
+      }
+      
+      /* Prevent clicking on the video to pause */
+      .custom-video-controls {
+        pointer-events: auto;
+      }
+      
+      .custom-video-controls::-webkit-media-controls-panel {
+        pointer-events: auto;
+      }
+    `;
+    document.head.appendChild(style);
+
+    return () => {
+      document.head.removeChild(style);
+    };
+  }, []);
+
+  return (
+    <>
+      <div className="card mx-8 mb-5">
+        <div className="card-body pb-0">
+          {/* Header */}
+          <div className="d-flex flex-wrap justify-content-between align-items-start gap-3 mb-4">
+            <div>
+              {/* <h3 className="fw-bolder fs-3 mb-1">Live Stream</h3> */}
+              <span className="text-theme fw-bold fs-7">
+                * There may be a delay of 10–12 seconds in the live stream due to
+                network latency.
+              </span>
+            </div>
+            <div className="d-flex align-items-center gap-2">
+              {connectionStatus === "connected" ? (
+                <span className="badge badge-light-success fw-bold fs-7 px-3 py-2">
+                  <span className="bullet bullet-dot bg-success me-2"></span>
+                  Connected
+                </span>
+              ) : (
+                <span className="badge badge-light-danger fw-bold fs-7 px-3 py-2">
+                  <span className="bullet bullet-dot bg-danger me-2"></span>
+                  {connectionStatus === "connecting" ? "Connecting..." : "Disconnected"}
+                </span>
+              )}
+            </div>
+          </div>
+
+          {/* Filter Bar */}
+          <div className="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-5">
+            {/* Online / All Toggle */}
+            <div className="d-flex rounded align-items-center">
+              <button
+                type="button"
+                className={`btn btn-sm btn-active-light-theme btn-click-effect ${
+                  showOnlineOnly ? "active border border-info border-1" : ""
+                } me-2 d-flex align-items-center`}
+                onClick={() => { setShowOnlineOnly(true); setCurrentPage(1); }}
+              >
+                <span className="bullet bullet-dot bg-success me-2"></span>
+                <span className="fw-bold text-dark">
+                  Online ({onlineCount})
+                </span>
+              </button>
+              <button
+                type="button"
+                className={`btn btn-sm btn-active-light-theme btn-click-effect ${
+                  !showOnlineOnly ? "active border border-info border-1" : ""
+                } d-flex align-items-center`}
+                onClick={() => { setShowOnlineOnly(false); setCurrentPage(1); }}
+              >
+                <span className="fw-bold text-dark">
+                  All Members ({memberOption.length})
+                </span>
+              </button>
+            </div>
+
+            {/* Search */}
+            <div className="position-relative" style={{ minWidth: "180px", maxWidth: "250px", flex: "1 1 180px" }}>
+              <span className="ki-outline ki-magnifier fs-3 position-absolute top-50 translate-middle-y ms-4 text-muted"></span>
+              <input
+                type="text"
+                className="form-control form-control-sm ps-11"
+                placeholder="Search by name or email..."
+                onChange={handleSearchChange}
+              />
+            </div>
+          </div>
+        </div>
+
+        <div className="d-flex flex-column px-5">
+          {loading && Loader("3rem")}
+
+          {/* User Grid */}
+          {!hasData && !loading && (
+            <div className="d-flex flex-column align-items-center justify-content-center py-15">
+              <span className="ki-outline ki-people fs-3x text-muted mb-3"></span>
+              <h4 className="text-muted fw-semibold">
+                {showOnlineOnly ? "No online members found" : "No members found"}
+              </h4>
+              {showOnlineOnly && memberOption.length > 0 && (
+                <button
+                  className="btn btn-sm btn-light-primary mt-3"
+                  onClick={() => setShowOnlineOnly(false)}
+                >
+                  View all members
+                </button>
+              )}
+            </div>
+          )}
+
+          <div className="row row-cols-1 row-cols-sm-2 row-cols-md-3 row-cols-lg-4 row-cols-xl-5 g-4 mb-5 w-100">
+            {!show &&
+              currentItems.map((user: any) => {
+                const isUserOnline = userValid(user);
+                return (
+                  <div className="col" key={user.userId}>
+                    <div
+                      className={`card h-100 shadow-sm border ${
+                        isUserOnline
+                          ? "border-success border-hover cursor-pointer hover-elevate-up"
+                          : "border-gray-200 opacity-75"
+                      }`}
+                      style={{ transition: "all 0.2s ease" }}
+                      onClick={() => {
+                        if (isUserOnline) {
+                          handleUserClick(user);
+                        }
+                        else toast.info("This user is currently offline");
+                      }}
+                    >
+                      <div className="card-body d-flex align-items-center gap-3 p-4">
+                        {/* Avatar with initials */}
+                        <div
+                          className={`d-flex align-items-center justify-content-center rounded-circle flex-shrink-0 ${
+                            isUserOnline ? "bg-light-success" : "bg-light"
+                          }`}
+                          style={{ width: "45px", height: "45px" }}
+                        >
+                          <span className={`fw-bold fs-5 ${isUserOnline ? "text-success" : "text-muted"}`}>
+                            {getInitials(user.fullName)}
+                          </span>
+                        </div>
+                        <div className="d-flex flex-column overflow-hidden">
+                          <div className="d-flex align-items-center gap-2">
+                            <span className="fw-bold text-dark text-truncate fs-6">
+                              {user.fullName}
+                            </span>
+                            <span
+                              className={`bullet bullet-dot ${isUserOnline ? "bg-success" : "bg-gray-400"}`}
+                              style={{ width: "8px", height: "8px", flexShrink: 0 }}
+                            ></span>
+                          </div>
+                          <span className="text-muted fs-7 text-truncate">
+                            {user.email}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+          </div>
+
+          {/* Pagination */}
+          {hasData &&
+            paginatioAndRowsPerPage({
+              rowsPerPageOptions,
+              itemsPerPage,
+              handleRowsPerPageChange,
+              filteredData: displayUsers,
+              hasData,
+              indexOfFirstItem,
+              indexOfLastItem,
+              currentPage,
+              setCurrentPage,
+              totalPages,
+            })}
+
+          {show && (
+            <video
+              ref={videoRef}
+              src="/media/video/1003935-hd_1920_1080_25fps.mp4"
+              className="hidden"
+              controls
+              playsInline
+            />
+          )}
+        </div>
+
+        {/* Modal and LoadingModal */}
+        {modalOpen && (
+          <Modal
+            show={modalOpen}
+            onHide={handleStreamClose}
+            centered
+            backdrop="static"
+            keyboard={false}
+            dialogClassName="modal-dialog modal-dialog-centered mw-1000px modal-xl"
+          >
+            <Modal.Header closeButton>
+              <Modal.Title>
+                <div className="d-flex align-items-center justify-content-center gap-2 ">
+                  <span className="d-md-inline text-dark fw-bold">
+                    {optionSelectedMember.fullName}
+                  </span>
+                  <div className="rounded-circle bg-success w-8px h-8px"></div>
+                </div>
+              </Modal.Title>
+            </Modal.Header>
+            <Modal.Body>
+              {isBuffering && (
+                <div style={{ textAlign: "center", marginBottom: 10 }}>
+                  <span>Buffering...</span>
+                </div>
+              )}
+
+              {SelectedUser.orgId === import.meta.env.VITE_APP_DEME_ORG_ID ? (
+                <video
+                  ref={demoVideoRef}
+                  src="/media/video/1003935-hd_1920_1080_25fps.mp4"
+                  className="custom-video-controls"
+                  controls
+                  autoPlay
+                  playsInline
+                  muted
+                  style={{
+                    width: "100%",
+                    height: "auto",
+                    backgroundColor: "black",
+                  }}
+                  onError={handlePlayerError}
+                  onWaiting={handleBuffer}
+                  onCanPlay={handleBufferEnd}
+                  onPause={handleVideoEvents}
+                  onPlay={handleVideoEvents}
+                  onSeeking={handleVideoEvents}
+                  onLoadedMetadata={(e) => {
+                    const target = e.target as HTMLVideoElement;
+                    // Ensure video starts playing and cannot be paused
+                    target
+                      .play()
+                      .catch((err) => console.log("Auto-play failed:", err));
+                  }}
+                  onClick={(e) => {
+                    // Prevent pause on video click
+                    e.preventDefault();
+                    const target = e.target as HTMLVideoElement;
+                    if (target.paused) {
+                      target
+                        .play()
+                        .catch((err) => console.log("Play failed:", err));
+                    }
+                  }}
+                />
+              ) : (
+                <div
+                  className="stream-container"
+                  style={{ position: "relative" }}
+                >
+                  {(() => {
+                    const videoStreamData = streams.find(
+                      (s) => s.hasVideo && s.stream.getVideoTracks().length > 0,
+                    );
+
+                    if (!videoStreamData) {
+                      return (
+                        <div
+                          style={{
+                            width: "100%",
+                            minHeight: "400px",
+                            backgroundColor: "black",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            color: "white",
+                          }}
+                        >
+                          <p>Waiting for video stream...</p>
+                        </div>
+                      );
+                    }
+
+                    const videoTrack =
+                      videoStreamData.stream.getVideoTracks()[0];
+
+                    if (videoTrack.readyState !== "live") {
+                      console.error(
+                        "❌ Video track is not live:",
+                        videoTrack.readyState,
+                      );
+                      return (
+                        <div
+                          style={{
+                            width: "100%",
+                            minHeight: "400px",
+                            backgroundColor: "black",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            color: "white",
+                          }}
+                        >
+                          <p>
+                            Video track is not live. State:{" "}
+                            {videoTrack.readyState}
+                          </p>
+                        </div>
+                      );
+                    }
+
+                    const videoOnlyStream = new MediaStream([videoTrack]);
+
+                    return (
+                      <video
+                        className="custom-video-controls"
+                        controls
+                        autoPlay
+                        playsInline
+                        muted
+                        ref={(el) => {
+                          if (!el) return;
+
+                          // Store the element reference
+                          videoElementRef.current = el;
+
+                          // Only attach stream once
+                          if (
+                            !isVideoAttachedRef.current &&
+                            el.srcObject !== videoOnlyStream
+                          ) {
+                            isVideoAttachedRef.current = true;
+
+                            el.srcObject = videoOnlyStream;
+
+                            // Add a small delay before playing
+                            setTimeout(() => {
+                              const playPromise = el.play();
+
+                              if (playPromise !== undefined) {
+                                playPromise
+                                  .then(() => {
+                                    // Video playback started successfully
+                                  })
+                                  .catch((err) => {
+                                    // Reset flag to allow retry
+                                    isVideoAttachedRef.current = false;
+                                  });
+                              }
+                            }, 100);
+                          }
+                        }}
+                        style={{
+                          width: "100%",
+                          height: "auto",
+                          backgroundColor: "black",
+                          minHeight: "400px",
+                        }}
+                        onLoadedMetadata={(e) => {
+                          const target = e.target as HTMLVideoElement;
+
+                          if (
+                            target.videoWidth === 0 ||
+                            target.videoHeight === 0
+                          ) {
+                            console.warn("⚠️ Video dimensions are 0!");
+                          }
+
+                          // Ensure video starts playing
+                          target
+                            .play()
+                            .catch((err) =>
+                              console.log("Auto-play failed:", err),
+                            );
+                        }}
+                        onLoadedData={(e) => {
+                          const target = e.target as HTMLVideoElement;
+                        }}
+                        onPlay={() => {}}
+                        onPause={handleVideoEvents}
+                        onSeeking={handleVideoEvents}
+                        onWaiting={() => {
+                          setIsBuffering(true);
+                        }}
+                        onCanPlay={() => {
+                          setIsBuffering(false);
+                        }}
+                        onError={(e) => {
+                          const target = e.target as HTMLVideoElement;
+                          console.error(`❌ Video error:`, {
+                            error: target.error,
+                            code: target.error?.code,
+                            message: target.error?.message,
+                            networkState: target.networkState,
+                            readyState: target.readyState,
+                          });
+                        }}
+                        onClick={(e) => {
+                          // Prevent pause on video click
+                          e.preventDefault();
+                          const target = e.target as HTMLVideoElement;
+                          if (target.paused) {
+                            target
+                              .play()
+                              .catch((err) => console.log("Play failed:", err));
+                          }
+                        }}
+                      />
+                    );
+                  })()}
+                </div>
+              )}
+            </Modal.Body>
+          </Modal>
+        )}
+        <LoadingModal
+          isVisible={showLoadingModal || videoRetryLoader}
+          setIsVisible={setShowLoadingModal}
+          executeFunction={handleLoadingClose}
+          showCrossIcon={true}
+        />
+
+        {/* Audit Reason Modal - Disabled for now, re-enable when needed */}
+        {/* <AuditReasonModal
+          show={showReasonModal}
+          userName={pendingStreamUser?.fullName}
+          onCancel={() => {
+            setShowReasonModal(false);
+            setPendingStreamUser(null);
+          }}
+          onConfirm={(reason) => {
+            setShowReasonModal(false);
+            if (pendingStreamUser) {
+              try {
+                addLiveTrackingAuditLog({
+                  orgId: SelectedUser.orgId,
+                  userId: pendingStreamUser.userId,
+                  eventType: "LiveStream",
+                  screen: "LiveStream",
+                  reason,
+                  startTime: new Date().toISOString(),
+                  endTime: new Date().toISOString(),
+                  requestBy: SelectedUser.userId,
+                });
+              } catch (e) {
+                // audit log failure should not block functionality
+              }
+              handleUserClick(pendingStreamUser);
+            }
+            setPendingStreamUser(null);
+          }}
+        /> */}
+      </div>
+    </>
+  );
+};
+
+export default LiveStreaming;
